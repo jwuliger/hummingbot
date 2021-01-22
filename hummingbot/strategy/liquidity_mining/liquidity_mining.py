@@ -14,6 +14,8 @@ from hummingbot.core.event.events import OrderType
 from hummingbot.core.data_type.limit_order import LimitOrder
 from hummingbot.core.utils.estimate_fee import estimate_fee
 from hummingbot.core.utils.market_price import usd_value
+from hummingbot.core.utils.async_utils import safe_ensure_future
+from hummingbot.connector.exchange.binance.binance_api_order_book_data_source import BinanceAPIOrderBookDataSource
 
 NaN = float("nan")
 s_decimal_zero = Decimal(0)
@@ -57,8 +59,20 @@ class LiquidityMiningStrategy(StrategyPyBase):
         self._token_balances = {}
         self._sell_budgets = {}
         self._buy_budgets = {}
-
+        self._mid_prices = {}
+        self._mid_price_polling_task = None
         self.add_markets([exchange])
+
+    async def mid_price_polling_loop(self):
+        while True:
+            try:
+                self._mid_prices = await BinanceAPIOrderBookDataSource.get_all_mid_prices()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self.logger().network("Unexpected error while fetching Binance mid prices.", exc_info=True)
+            finally:
+                await asyncio.sleep(0.5)
 
     @property
     def active_orders(self):
@@ -91,11 +105,15 @@ class LiquidityMiningStrategy(StrategyPyBase):
 
         self._last_timestamp = timestamp
 
+    def get_mid_price(self, trading_pair: str) -> Decimal:
+        # self._market_infos[order.trading_pair].get_mid_price()
+        return self._mid_prices[trading_pair]
+
     async def active_orders_df(self) -> pd.DataFrame:
         columns = ["Market", "Side", "Price", "Spread", "Size", "Size ($)", "Age"]
         data = []
         for order in self.active_orders:
-            mid_price = self._market_infos[order.trading_pair].get_mid_price()
+            mid_price = self.get_mid_price(order.trading_pair)
             spread = 0 if mid_price == 0 else abs(order.price - mid_price) / mid_price
             size_usd = await usd_value(order.trading_pair.split("-")[0], order.quantity)
             age = "n/a"
@@ -135,15 +153,16 @@ class LiquidityMiningStrategy(StrategyPyBase):
         return "\n".join(lines)
 
     def start(self, clock: Clock, timestamp: float):
-        pass
+        self._mid_price_polling_task = safe_ensure_future(self.mid_price_polling_loop())
 
     def stop(self, clock: Clock):
-        pass
+        if self._mid_price_polling_task is not None:
+            self._mid_price_polling_task.cancel()
 
     def create_base_proposals(self):
         proposals = []
         for market, market_info in self._market_infos.items():
-            mid_price = market_info.get_mid_price()
+            mid_price = self.get_mid_price(market)  # market_info.get_mid_price()
             buy_price = mid_price * (Decimal("1") - self._custom_spread_pct)
             buy_price = self._exchange.quantize_order_price(market, buy_price)
             sell_price = mid_price * (Decimal("1") + self._custom_spread_pct)
@@ -181,7 +200,7 @@ class LiquidityMiningStrategy(StrategyPyBase):
         for proposal in proposals:
             sell_size = balances[proposal.base()] if balances[proposal.base()] < self._sell_budgets[proposal.market] \
                 else self._sell_budgets[proposal.market]
-            sell_size = self._exchange.quantize_order_amount(proposal.market, sell_size)
+            sell_size = self._exchange.quantize_order_amount(proposal.market, sell_size, proposal.sell.price)
             if sell_size > s_decimal_zero:
                 proposal.sell.size = sell_size
                 balances[proposal.base()] -= sell_size
@@ -191,7 +210,7 @@ class LiquidityMiningStrategy(StrategyPyBase):
             buy_fee = estimate_fee(self._exchange.name, True)
             buy_size = quote_size / (proposal.buy.price * (Decimal("1") + buy_fee.percent))
             if buy_size > s_decimal_zero:
-                proposal.buy.size = self._exchange.quantize_order_amount(proposal.market, buy_size)
+                proposal.buy.size = self._exchange.quantize_order_amount(proposal.market, buy_size, proposal.buy.price)
                 balances[proposal.quote()] -= quote_size
 
         # base_tokens = self.all_base_tokens()

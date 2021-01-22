@@ -18,7 +18,7 @@ def start(self):
 
     markets = list(markets_text.split(","))
 
-    self._initialize_markets([(exchange, markets)])
+    self._initialize_markets([(exchange, [markets[0]])])
     exchange = self.markets[exchange]
     market_infos = {}
     for market in markets:
